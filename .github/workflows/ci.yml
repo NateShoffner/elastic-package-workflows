@@ -1,0 +1,271 @@
+name: Package CI
+
+# Reusable CI for a single Elastic integration package. The caller owns the
+# triggers; see the README for the snippet to drop into an integration repo.
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: >-
+          Path to the package directory, relative to the repository root, for
+          example "packages/my_package". Use "." when the package is the
+          repository root.
+        type: string
+        required: true
+      stack-tests:
+        description: >-
+          Also run the test types that need a full stack (asset, policy, script
+          and system tests). Off by default: booting Elasticsearch, Kibana,
+          Fleet Server and an agent takes several minutes.
+        type: boolean
+        required: false
+        default: false
+      runs-on:
+        description: Runner label used by every job.
+        type: string
+        required: false
+        default: ubuntu-24.04
+      elastic-package-version:
+        description: >-
+          elastic-package release to install, with or without the leading "v".
+        type: string
+        required: false
+        default: v0.126.4
+    outputs:
+      test-types:
+        description: Space-separated test types detected in the package.
+        value: ${{ jobs.detect.outputs.all-types }}
+      package-artifact:
+        description: Name of the artifact holding the built package zip.
+        value: ${{ jobs.detect.outputs.package-artifact }}
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Detect test types
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      light-types: ${{ steps.detect.outputs.light-types }}
+      stack-types: ${{ steps.detect.outputs.stack-types }}
+      all-types: ${{ steps.detect.outputs.all-types }}
+      package-name: ${{ steps.detect.outputs.package-name }}
+      package-artifact: ${{ steps.detect.outputs.package-name }}-package
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Detect test types
+        id: detect
+        shell: bash
+        env:
+          PACKAGE: ${{ inputs.package }}
+        run: |
+          set -euo pipefail
+
+          pkg="${PACKAGE%/}"
+          [ -n "$pkg" ] || pkg="."
+
+          if [ ! -f "$pkg/manifest.yml" ]; then
+            echo "::error::No manifest.yml under '${pkg}'; the 'package' input must point at the package directory"
+            exit 1
+          fi
+
+          # elastic-package keeps test configs per data stream, and at package
+          # level for input packages, so both locations are scanned. Unmatched
+          # globs stay literal and are dropped by the -d test.
+          found=""
+          for dir in "$pkg"/_dev/test/*/ "$pkg"/data_stream/*/_dev/test/*/; do
+            [ -d "$dir" ] || continue
+            type="$(basename "$dir")"
+            case " ${found} " in
+              *" ${type} "*) continue ;;
+            esac
+            found="${found}${type} "
+          done
+
+          # Split by what each runner needs from the stack rather than by a
+          # fixed list of test types: pipeline tests only call the Elasticsearch
+          # simulate API and static tests need no stack at all, while asset,
+          # policy, script and system tests also need Kibana and Fleet.
+          light="" stack="" unknown=""
+          for type in $found; do
+            case "$type" in
+              pipeline|static)            light="${light}${type} " ;;
+              asset|policy|script|system) stack="${stack}${type} " ;;
+              *)                          unknown="${unknown}${type} " ;;
+            esac
+          done
+          light="${light% }"
+          stack="${stack% }"
+
+          for type in $unknown; do
+            echo "::warning::Ignoring '${pkg}/**/_dev/test/${type}': not an elastic-package test type"
+          done
+
+          # The directory name is the package name by convention, but the
+          # manifest is the real source of truth for artifact naming.
+          name="$(sed -n 's/^name:[[:space:]]*["'"'"']\{0,1\}\([A-Za-z0-9_.-]\{1,\}\).*/\1/p' "$pkg/manifest.yml" | head -1)"
+          [ -n "$name" ] || name="$(basename "$pkg")"
+
+          all="$(echo "${light} ${stack}" | tr -s ' ' | sed 's/^ //;s/ $//')"
+
+          {
+            echo "light-types=${light}"
+            echo "stack-types=${stack}"
+            echo "all-types=${all}"
+            echo "package-name=${name}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### ${name}"
+            echo
+            echo "| Test types | Detected |"
+            echo "| --- | --- |"
+            echo "| Without a full stack | ${light:-none} |"
+            echo "| With a full stack | ${stack:-none} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Detected test types: ${all:-none}"
+
+  check:
+    name: Lint and build
+    needs: detect
+    runs-on: ${{ inputs.runs-on }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.package }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: NateShoffner/elastic-package-action@v1
+        with:
+          version: ${{ inputs.elastic-package-version }}
+
+      - name: Check package
+        run: elastic-package check -v
+
+      - name: Upload built package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ needs.detect.outputs.package-artifact }}
+          # Artifact paths are relative to the workspace, not to
+          # working-directory, and elastic-package writes the zip to build/ at
+          # the root of the repository checkout.
+          path: build/packages/*.zip
+          if-no-files-found: error
+
+  light-tests:
+    name: Tests without a full stack
+    needs: detect
+    if: needs.detect.outputs.light-types != ''
+    runs-on: ${{ inputs.runs-on }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.package }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: NateShoffner/elastic-package-action@v1
+        with:
+          version: ${{ inputs.elastic-package-version }}
+
+      # Pipeline tests exercise ingest pipelines through the Elasticsearch
+      # simulate API and never touch Kibana or Fleet, so an Elasticsearch-only
+      # stack is enough. Static tests need no stack, so a package with only
+      # static tests boots nothing.
+      - name: Boot Elasticsearch
+        if: contains(needs.detect.outputs.light-types, 'pipeline')
+        run: elastic-package stack up -d -v --services elasticsearch
+
+      - name: Run tests
+        env:
+          TYPES: ${{ needs.detect.outputs.light-types }}
+        run: |
+          set -uo pipefail
+
+          # Every detected type runs even after one fails, so a single CI run
+          # reports every broken test type rather than just the first.
+          failed=""
+          for type in $TYPES; do
+            echo "::group::elastic-package test ${type}"
+            if elastic-package test "$type" -v --report-format xUnit --report-output file; then
+              echo "- \`${type}\`: passed" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- \`${type}\`: **failed**" >> "$GITHUB_STEP_SUMMARY"
+              failed="${failed}${type} "
+            fi
+            echo "::endgroup::"
+          done
+
+          if [ -n "$failed" ]; then
+            echo "::error::Failing test types: ${failed% }"
+            exit 1
+          fi
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ needs.detect.outputs.package-name }}-test-reports-light
+          path: ~/.elastic-package/tmp/test-results/*.xml
+          if-no-files-found: ignore
+
+      - name: Tear down the stack
+        if: always() && contains(needs.detect.outputs.light-types, 'pipeline')
+        run: elastic-package stack down -v
+
+  stack-tests:
+    name: Tests with a full stack
+    needs: detect
+    if: inputs.stack-tests && needs.detect.outputs.stack-types != ''
+    runs-on: ${{ inputs.runs-on }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.package }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: NateShoffner/elastic-package-action@v1
+        with:
+          version: ${{ inputs.elastic-package-version }}
+
+      # One stack serves every type in this tier, so booting it once is worth
+      # more than running the types in parallel.
+      - name: Boot up the stack
+        run: elastic-package stack up -d -v
+
+      - name: Run tests
+        env:
+          TYPES: ${{ needs.detect.outputs.stack-types }}
+        run: |
+          set -uo pipefail
+
+          failed=""
+          for type in $TYPES; do
+            echo "::group::elastic-package test ${type}"
+            if elastic-package test "$type" -v --report-format xUnit --report-output file; then
+              echo "- \`${type}\`: passed" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- \`${type}\`: **failed**" >> "$GITHUB_STEP_SUMMARY"
+              failed="${failed}${type} "
+            fi
+            echo "::endgroup::"
+          done
+
+          if [ -n "$failed" ]; then
+            echo "::error::Failing test types: ${failed% }"
+            exit 1
+          fi
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ needs.detect.outputs.package-name }}-test-reports-stack
+          path: ~/.elastic-package/tmp/test-results/*.xml
+          if-no-files-found: ignore
+
+      - name: Tear down the stack
+        if: always()
+        run: elastic-package stack down -v
