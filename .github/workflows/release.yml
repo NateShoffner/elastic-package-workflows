@@ -1,0 +1,388 @@
+name: Package release
+
+# Reusable release workflow for a single Elastic integration package. The caller
+# owns the triggers; see the README for the snippet to drop into an integration
+# repo.
+#
+# The test jobs are copied from ci.yml rather than called from it: a reusable
+# workflow is checked out from the caller's repository, so there is no shared
+# place to put the steps, and chaining ci.yml from here would resolve the
+# relative path in a way that depends on which repository is calling.
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: >-
+          Path to the package directory, relative to the repository root, for
+          example "packages/my_package". Use "." when the package is the
+          repository root.
+        type: string
+        required: true
+      tag-prefix:
+        description: >-
+          Prefix stripped from the tag to get the package version. Pass an empty
+          string for unprefixed tags. A tag that does not start with this prefix
+          fails the release.
+        type: string
+        required: false
+        default: v
+      stack-tests:
+        description: >-
+          Gate the release on the test types that need a full stack (asset,
+          policy, script and system tests). On by default: a tagged release is
+          rare enough to be worth the extra minutes.
+        type: boolean
+        required: false
+        default: true
+      runs-on:
+        description: Runner label used by every job.
+        type: string
+        required: false
+        default: ubuntu-24.04
+      elastic-package-version:
+        description: >-
+          elastic-package release to install, with or without the leading "v".
+        type: string
+        required: false
+        default: v0.126.4
+      tag:
+        description: >-
+          Tag to release. Defaults to the tag that triggered the caller's run.
+          Set it to release a tag other than the triggering ref, or to exercise
+          this workflow from a branch with dry-run.
+        type: string
+        required: false
+        default: ''
+      dry-run:
+        description: >-
+          Run every check, build the zip and render the notes, but do not create
+          the GitHub release or the attestation.
+        type: boolean
+        required: false
+        default: false
+      attest:
+        description: >-
+          Attach a signed build provenance attestation to the zip. Turn this off
+          on plans where artifact attestations are unavailable, such as private
+          repositories outside GitHub Enterprise Cloud.
+        type: boolean
+        required: false
+        default: true
+    outputs:
+      version:
+        description: The released package version, without the tag prefix.
+        value: ${{ jobs.verify-version.outputs.version }}
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Detect test types
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      light-types: ${{ steps.detect.outputs.light-types }}
+      stack-types: ${{ steps.detect.outputs.stack-types }}
+      package-name: ${{ steps.detect.outputs.package-name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Detect test types
+        id: detect
+        shell: bash
+        env:
+          PACKAGE: ${{ inputs.package }}
+        run: |
+          set -euo pipefail
+
+          pkg="${PACKAGE%/}"
+          [ -n "$pkg" ] || pkg="."
+
+          if [ ! -f "$pkg/manifest.yml" ]; then
+            echo "::error::No manifest.yml under '${pkg}'; the 'package' input must point at the package directory"
+            exit 1
+          fi
+
+          # elastic-package keeps test configs per data stream, and at package
+          # level for input packages, so both locations are scanned. Unmatched
+          # globs stay literal and are dropped by the -d test.
+          found=""
+          for dir in "$pkg"/_dev/test/*/ "$pkg"/data_stream/*/_dev/test/*/; do
+            [ -d "$dir" ] || continue
+            type="$(basename "$dir")"
+            case " ${found} " in
+              *" ${type} "*) continue ;;
+            esac
+            found="${found}${type} "
+          done
+
+          # Split by what each runner needs from the stack rather than by a
+          # fixed list of test types: pipeline tests only call the Elasticsearch
+          # simulate API and static tests need no stack at all, while asset,
+          # policy, script and system tests also need Kibana and Fleet.
+          light="" stack="" unknown=""
+          for type in $found; do
+            case "$type" in
+              pipeline|static)            light="${light}${type} " ;;
+              asset|policy|script|system) stack="${stack}${type} " ;;
+              *)                          unknown="${unknown}${type} " ;;
+            esac
+          done
+          light="${light% }"
+          stack="${stack% }"
+
+          for type in $unknown; do
+            echo "::warning::Ignoring '${pkg}/**/_dev/test/${type}': not an elastic-package test type"
+          done
+
+          # The directory name is the package name by convention, but the
+          # manifest is the real source of truth for artifact naming.
+          name="$(sed -n 's/^name:[[:space:]]*["'"'"']\{0,1\}\([A-Za-z0-9_.-]\{1,\}\).*/\1/p' "$pkg/manifest.yml" | head -1)"
+          [ -n "$name" ] || name="$(basename "$pkg")"
+
+          {
+            echo "light-types=${light}"
+            echo "stack-types=${stack}"
+            echo "package-name=${name}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Detected test types: ${light} ${stack}"
+
+  verify-version:
+    name: Verify version
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      version: ${{ steps.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The tag is the source of truth for what gets published, but the package
+      # version comes from manifest.yml. If they disagree the release would be
+      # mislabelled, so fail before anything is published.
+      - uses: NateShoffner/elastic-package-action/verify-version@v1
+        id: verify
+        with:
+          manifest-path: ${{ inputs.package }}/manifest.yml
+          tag: ${{ inputs.tag || github.ref_name }}
+          tag-prefix: ${{ inputs.tag-prefix }}
+
+  check:
+    name: Lint and build
+    runs-on: ${{ inputs.runs-on }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.package }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: NateShoffner/elastic-package-action@v1
+        with:
+          version: ${{ inputs.elastic-package-version }}
+
+      - name: Check package
+        run: elastic-package check -v
+
+  light-tests:
+    name: Tests without a full stack
+    needs: detect
+    if: needs.detect.outputs.light-types != ''
+    runs-on: ${{ inputs.runs-on }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.package }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: NateShoffner/elastic-package-action@v1
+        with:
+          version: ${{ inputs.elastic-package-version }}
+
+      - name: Boot Elasticsearch
+        if: contains(needs.detect.outputs.light-types, 'pipeline')
+        run: elastic-package stack up -d -v --services elasticsearch
+
+      - name: Run tests
+        env:
+          TYPES: ${{ needs.detect.outputs.light-types }}
+        run: |
+          set -uo pipefail
+
+          failed=""
+          for type in $TYPES; do
+            echo "::group::elastic-package test ${type}"
+            if elastic-package test "$type" -v --report-format xUnit --report-output file; then
+              echo "- \`${type}\`: passed" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- \`${type}\`: **failed**" >> "$GITHUB_STEP_SUMMARY"
+              failed="${failed}${type} "
+            fi
+            echo "::endgroup::"
+          done
+
+          if [ -n "$failed" ]; then
+            echo "::error::Failing test types: ${failed% }"
+            exit 1
+          fi
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ needs.detect.outputs.package-name }}-test-reports-light
+          path: ~/.elastic-package/tmp/test-results/*.xml
+          if-no-files-found: ignore
+
+      - name: Tear down the stack
+        if: always() && contains(needs.detect.outputs.light-types, 'pipeline')
+        run: elastic-package stack down -v
+
+  stack-tests:
+    name: Tests with a full stack
+    needs: detect
+    if: inputs.stack-tests && needs.detect.outputs.stack-types != ''
+    runs-on: ${{ inputs.runs-on }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.package }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: NateShoffner/elastic-package-action@v1
+        with:
+          version: ${{ inputs.elastic-package-version }}
+
+      - name: Boot up the stack
+        run: elastic-package stack up -d -v
+
+      - name: Run tests
+        env:
+          TYPES: ${{ needs.detect.outputs.stack-types }}
+        run: |
+          set -uo pipefail
+
+          failed=""
+          for type in $TYPES; do
+            echo "::group::elastic-package test ${type}"
+            if elastic-package test "$type" -v --report-format xUnit --report-output file; then
+              echo "- \`${type}\`: passed" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- \`${type}\`: **failed**" >> "$GITHUB_STEP_SUMMARY"
+              failed="${failed}${type} "
+            fi
+            echo "::endgroup::"
+          done
+
+          if [ -n "$failed" ]; then
+            echo "::error::Failing test types: ${failed% }"
+            exit 1
+          fi
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ needs.detect.outputs.package-name }}-test-reports-stack
+          path: ~/.elastic-package/tmp/test-results/*.xml
+          if-no-files-found: ignore
+
+      - name: Tear down the stack
+        if: always()
+        run: elastic-package stack down -v
+
+  release:
+    name: Build and publish package
+    needs: [detect, verify-version, check, light-tests, stack-tests]
+    # A test job that was never scheduled, because the package has no tests of
+    # that tier or because stack-tests is off, must not skip the release. Any
+    # test job that actually failed must.
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: NateShoffner/elastic-package-action@v1
+        with:
+          version: ${{ inputs.elastic-package-version }}
+
+      - name: Build package
+        working-directory: ${{ inputs.package }}
+        run: elastic-package build -v
+
+      # elastic-package writes the zip to build/ at the root of the repository
+      # checkout, not inside the package directory, so the rest of this job runs
+      # from the workspace root.
+      - name: Locate the built zip
+        id: zip
+        run: |
+          set -euo pipefail
+
+          if [ ! -d build/packages ]; then
+            echo "::error::elastic-package produced no build/packages directory"
+            exit 1
+          fi
+
+          zips="$(find build/packages -maxdepth 1 -type f -name '*.zip')"
+          count="$(printf '%s' "$zips" | grep -c . || true)"
+          if [ "$count" != "1" ]; then
+            echo "::error::Expected exactly one zip in build/packages, found ${count}"
+            printf '%s\n' "$zips"
+            exit 1
+          fi
+
+          path="$zips"
+          echo "path=${path}" >> "$GITHUB_OUTPUT"
+          echo "Built ${path}"
+
+      - name: Render release notes
+        id: notes
+        uses: NateShoffner/elastic-package-action/release-notes@v1
+        with:
+          changelog-path: ${{ inputs.package }}/changelog.yml
+          # verify-version has already established that this version is the one
+          # the manifest declares, so a changelog that says nothing about it is
+          # an oversight worth failing on rather than publishing a placeholder.
+          version: ${{ needs.verify-version.outputs.version }}
+          fail-if-missing: true
+
+      - name: Attest build provenance
+        if: inputs.attest && !inputs.dry-run
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.zip.outputs.path }}
+
+      - name: Create release
+        if: ${{ !inputs.dry-run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZIP: ${{ steps.zip.outputs.path }}
+          NOTES_FILE: ${{ steps.notes.outputs.notes-file }}
+        run: |
+          set -euo pipefail
+
+          gh release create "$TAG" "$ZIP" \
+            --title "$TAG" \
+            --notes-file "$NOTES_FILE"
+
+      - name: Summarise the dry run
+        if: inputs.dry-run
+        env:
+          ZIP: ${{ steps.zip.outputs.path }}
+          NOTES_FILE: ${{ steps.notes.outputs.notes-file }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "### Dry run for ${TAG}"
+            echo
+            echo "Would publish \`${ZIP}\` with these notes:"
+            echo
+            cat "$NOTES_FILE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::notice::Dry run: no release and no attestation were created for ${TAG}"
