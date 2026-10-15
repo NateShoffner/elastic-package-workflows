@@ -5,7 +5,7 @@
 # system-testable, with no --data-streams input to maintain.
 skip:
   reason: The fixture package ships no service deployment for the filestream input.
-  link: https://github.com/NateShoffner/elastic-package-workflows#data-streams-that-cannot-be-system-tested
+  link: https://github.com/NateShoffner/elastic-package-workflows#test-types
 input: filestream
 data_stream:
   vars:
