@@ -1,0 +1,12 @@
+version: 2
+
+updates:
+  # Third-party actions in the workflows are pinned to commit SHAs, which go
+  # stale silently where a major tag would have moved on its own.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: chore
+      include: scope
