@@ -1,2 +1,3 @@
 # elastic-package writes built packages to build/ at the repository root.
-build/
+# Anchored, so it cannot also swallow a package's own _dev/build directory.
+/build/
