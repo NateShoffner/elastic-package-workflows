@@ -1,0 +1,32 @@
+---
+description: Pipeline for parsing fixture sample logs.
+processors:
+  - grok:
+      tag: grok_sample_line
+      field: message
+      patterns:
+        - '^%{TIMESTAMP_ISO8601:event_time} %{WORD:level} %{GREEDYDATA:detail}$'
+  - date:
+      tag: date_event_time
+      field: event_time
+      formats:
+        - ISO8601
+  # The fixture maps no ECS fields beyond the failure handler, so the raw line
+  # and the scratch timestamp are dropped rather than documented in fields.yml.
+  - remove:
+      tag: remove_consumed_fields
+      field:
+        - event_time
+        - message
+on_failure:
+  - set:
+      field: error.message
+      value: >-
+        Processor '{{{ _ingest.on_failure_processor_type }}}'
+        with tag '{{{ _ingest.on_failure_processor_tag }}}'
+        in pipeline '{{{ _ingest.pipeline }}}'
+        failed with message '{{{ _ingest.on_failure_message }}}'
+  - set:
+      field: event.kind
+      tag: set_pipeline_error_to_event_kind
+      value: pipeline_error

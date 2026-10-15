@@ -1,0 +1,6 @@
+- name: level
+  type: keyword
+  description: Severity word parsed from the log line.
+- name: detail
+  type: keyword
+  description: Free-text remainder of the log line.

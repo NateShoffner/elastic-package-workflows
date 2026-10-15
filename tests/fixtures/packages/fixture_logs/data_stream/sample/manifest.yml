@@ -1,0 +1,16 @@
+title: Fixture sample logs
+type: logs
+streams:
+  - input: filestream
+    title: Fixture sample logs
+    description: Read fixture sample logs from disk.
+    template_path: filestream.yml.hbs
+    vars:
+      - name: paths
+        type: text
+        title: Paths
+        multi: true
+        required: true
+        show_user: true
+        default:
+          - /var/log/fixture.log

@@ -1,0 +1,89 @@
+name: Self-test
+
+# Runs both reusable workflows against the minimal fixture package in this
+# repository, so a change to ci.yml or release.yml is exercised here before an
+# integration repo picks it up.
+#
+# The caller here is this repository, so "./.github/workflows/..." and the
+# fixture both come from the commit under test.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci-without-stack-tests:
+    name: ci.yml
+    uses: ./.github/workflows/ci.yml
+    with:
+      package: tests/fixtures/packages/fixture_logs
+      stack-tests: false
+
+  # The fixture's system test is skipped with a reason, so this leg proves the
+  # full-stack tier boots, runs and tears down, and that a package whose data
+  # streams are not all system-testable still passes with no --data-streams
+  # input to maintain.
+  ci-with-stack-tests:
+    name: ci.yml (stack tests)
+    uses: ./.github/workflows/ci.yml
+    with:
+      package: tests/fixtures/packages/fixture_logs
+      stack-tests: true
+
+  assert-outputs:
+    name: Assert workflow outputs
+    needs: ci-without-stack-tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check detected test types and artifact name
+        env:
+          TYPES: ${{ needs.ci-without-stack-tests.outputs.test-types }}
+          ARTIFACT: ${{ needs.ci-without-stack-tests.outputs.package-artifact }}
+        run: |
+          set -uo pipefail
+
+          status=0
+
+          # The fixture has pipeline tests and a skipped system test, and
+          # nothing else, so detection must report exactly these two.
+          if [ "$TYPES" != "pipeline system" ]; then
+            echo "::error::Expected test-types 'pipeline system', got '${TYPES}'"
+            status=1
+          fi
+
+          # The artifact name comes from manifest.yml rather than from the
+          # directory name.
+          if [ "$ARTIFACT" != "fixture_logs-package" ]; then
+            echo "::error::Expected package-artifact 'fixture_logs-package', got '${ARTIFACT}'"
+            status=1
+          fi
+
+          if [ "$status" -eq 0 ]; then
+            echo "Outputs are as expected."
+          fi
+          exit "$status"
+
+  # Exercises verify-version, the build, the rendered notes and the job wiring
+  # without publishing anything. The tag matches the fixture's manifest version,
+  # so verify-version passes; a mismatch here would be a real failure.
+  release-dry-run:
+    name: release.yml (dry run)
+    uses: ./.github/workflows/release.yml
+    # release.yml asks for these in its release job. A called workflow cannot
+    # request more than its caller grants, so they are granted here even though
+    # the dry run never uses them.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    with:
+      package: tests/fixtures/packages/fixture_logs
+      tag: v0.1.0
+      dry-run: true
+      # The full-stack tier is already covered by ci-with-stack-tests, and
+      # booting a second stack here would only repeat it.
+      stack-tests: false

@@ -1,0 +1,13 @@
+# There is no docker-based mock for the filestream input in this fixture, so the
+# system test is skipped with a reason instead of being left out. The skip keeps
+# "system" in the detected test types, which is what lets the reusable workflows
+# run `elastic-package test system` for a package whose data streams are not all
+# system-testable, with no --data-streams input to maintain.
+skip:
+  reason: The fixture package ships no service deployment for the filestream input.
+  link: https://github.com/NateShoffner/elastic-package-workflows#data-streams-that-cannot-be-system-tested
+input: filestream
+data_stream:
+  vars:
+    paths:
+      - /var/log/fixture.log

@@ -1,0 +1,4 @@
+- external: ecs
+  name: error.message
+- external: ecs
+  name: event.kind

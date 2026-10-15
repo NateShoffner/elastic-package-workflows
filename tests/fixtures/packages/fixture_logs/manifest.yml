@@ -1,0 +1,24 @@
+format_version: 3.6.6
+name: fixture_logs
+title: Fixture Logs
+version: 0.1.0
+description: Minimal package used to self-test the reusable CI and release workflows.
+type: integration
+categories:
+  - custom
+conditions:
+  kibana:
+    version: "^9.5.3"
+  elastic:
+    subscription: basic
+policy_templates:
+  - name: sample
+    title: Fixture sample logs
+    description: Collect fixture sample logs from a file.
+    inputs:
+      - type: filestream
+        title: Collect fixture sample logs
+        description: Read fixture sample logs from disk.
+owner:
+  github: NateShoffner
+  type: community

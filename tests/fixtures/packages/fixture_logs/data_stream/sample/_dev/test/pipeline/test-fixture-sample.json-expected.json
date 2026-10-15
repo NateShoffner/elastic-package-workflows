@@ -1,0 +1,14 @@
+{
+  "expected": [
+    {
+      "@timestamp": "2026-01-02T03:04:05.000Z",
+      "detail": "fixture started",
+      "level": "INFO"
+    },
+    {
+      "@timestamp": "2026-01-02T03:04:06.000Z",
+      "detail": "disk almost full",
+      "level": "WARN"
+    }
+  ]
+}
