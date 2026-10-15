@@ -1,0 +1,2 @@
+# The workflows embed bash, so LF everywhere regardless of checkout platform.
+* text=auto eol=lf

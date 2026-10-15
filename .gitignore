@@ -1,0 +1,2 @@
+# elastic-package writes built packages to build/ at the repository root.
+build/
